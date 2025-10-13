@@ -1,0 +1,93 @@
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error
+import requests
+import os
+
+# For file upload
+from google.colab import files
+
+# Fix random seeds
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# === Upload the dataset interactively ===
+print("Please upload the dataset file: 01_District_wise_crimes_committed_IPC_2001_2012.csv")
+uploaded = files.upload()
+
+# Get the uploaded file name dynamically
+file_name = list(uploaded.keys())[0]
+df = pd.read_csv(file_name).query('YEAR >= 2001').dropna()
+
+scaler = MinMaxScaler()
+
+@tf.function
+def predict_crime_rate(state, district):
+    location_data = df[(df['STATE/UT'] == state) & (df['DISTRICT'] == district)]
+    if location_data.empty:
+        return None, None, []
+
+    X, y = location_data[['YEAR']], location_data['TOTAL IPC CRIMES']
+    y_percentage = (y / y.sum() * 100).dropna()
+
+    X_scaled, y_scaled = scaler.fit_transform(X), scaler.fit_transform(y_percentage.values.reshape(-1, 1))
+
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(X_scaled.shape[1], 1)),
+        tf.keras.layers.LSTM(128, return_sequences=True, dropout=0.3),
+        tf.keras.layers.LSTM(64, dropout=0.3),
+        tf.keras.layers.Dense(1)
+    ])
+
+    model.compile(optimizer='adam', loss='mean_absolute_error')
+    model.fit(np.expand_dims(X_scaled, axis=-1), y_scaled, epochs=50, batch_size=16, verbose=0)
+
+    prediction_scaled = model.predict(scaler.transform([[2013]]).reshape(1, 1, 1))[0][0]
+    prediction = scaler.inverse_transform([[prediction_scaled]])[0][0]
+
+    mae = mean_absolute_error(
+        y_percentage,
+        scaler.inverse_transform(model.predict(np.expand_dims(X_scaled, axis=-1)))
+    )
+
+    # Top 2 most frequent crimes excluding 'Other IPC Crimes'
+    crime_columns = location_data.columns.difference(
+        ['YEAR', 'TOTAL IPC CRIMES', 'STATE/UT', 'DISTRICT', 'Other IPC Crimes']
+    )
+    top_crimes = location_data[crime_columns].sum().nlargest(2)
+    top_crimes = [crime for crime in top_crimes.index if crime != 'Other IPC Crimes'][:2]
+
+    return prediction, mae, top_crimes
+
+# Real-Time Crime News
+def fetch_crime_news(district):
+    api_key = os.getenv('NEWS_API_KEY', '09383da7125b470490162d0d9d548aeb')
+    url = f'https://newsapi.org/v2/everything?q=crime%20{district}&language=en&sortBy=relevancy&pageSize=5&apiKey={api_key}'
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            return [f"- {article['title']}: {article['url']}" for article in response.json().get('articles', [])]
+        else:
+            return ['News service currently unavailable.']
+    except Exception as e:
+        return [f"Error fetching news: {e}"]
+
+if _name_ == "_main_":
+    tf.config.run_functions_eagerly(True)
+
+    state_input, district_input = input("Enter the state: "), input("Enter the district: ")
+
+    prediction, mae, top_crimes = predict_crime_rate(state_input, district_input)
+
+    if prediction:
+        print(f"\nCrime rate predicted for 2013 in {district_input}, {state_input}: {prediction:.2f}%")
+        print(f"Mean Absolute Error (MAE): {mae:.2f}%")
+        print("\nTop 2 Most Frequent Crimes (excluding 'Other IPC Crimes'):")
+        print(', '.join(top_crimes) if top_crimes else "No data available")
+        print("\nReal-Time District-Specific Crime News:")
+        for article in fetch_crime_news(district_input):
+            print(article)
+    else:
+        print("No data found for the specified location.")
